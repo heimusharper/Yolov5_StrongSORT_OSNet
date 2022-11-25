@@ -8,6 +8,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
+import cv2
 import sys
 import numpy as np
 from pathlib import Path
@@ -24,26 +25,29 @@ if str(ROOT / 'yolov5') not in sys.path:
     sys.path.append(str(ROOT / 'yolov5'))  # add yolov5 ROOT to PATH
 if str(ROOT / 'trackers' / 'strong_sort') not in sys.path:
     sys.path.append(str(ROOT / 'trackers' / 'strong_sort'))  # add strong_sort ROOT to PATH
-
+if str(ROOT / 'trackers' / 'ocsort') not in sys.path:
+    sys.path.append(str(ROOT / 'trackers' / 'ocsort'))  # add strong_sort ROOT to PATH
+if str(ROOT / 'trackers' / 'strong_sort' / 'deep' / 'reid' / 'torchreid') not in sys.path:
+    sys.path.append(str(ROOT / 'trackers' / 'strong_sort' / 'deep' / 'reid' / 'torchreid'))  # add strong_sort ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import logging
 from yolov5.models.common import DetectMultiBackend
 from yolov5.utils.dataloaders import VID_FORMATS, LoadImages, LoadStreams
-from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_boxes, check_requirements, cv2,
+from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
                                   check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr, print_args, check_file)
-from yolov5.utils.torch_utils import select_device, time_sync
+from yolov5.utils.torch_utils import scale_img, select_device, time_sync
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from trackers.multi_tracker_zoo import create_tracker
 
 # remove duplicated stream handler to avoid duplicated logging
-#logging.getLogger().removeHandler(logging.getLogger().handlers[0])
+logging.getLogger().removeHandler(logging.getLogger().handlers[0])
 
 @torch.no_grad()
 def run(
         source='0',
         yolo_weights=WEIGHTS / 'yolov5m.pt',  # model.pt path(s),
-        reid_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
+        appearance_descriptor_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
         tracking_method='strongsort',
         imgsz=(640, 640),  # inference size (height, width)
         conf_thres=0.25,  # confidence threshold
@@ -59,7 +63,7 @@ def run(
         classes=None,  # filter by class: --class 0, or --class 0 2 3
         agnostic_nms=False,  # class-agnostic NMS
         augment=False,  # augmented inference
-        visualize=False,  # visualize features
+        visualize=True,  # visualize features
         update=False,  # update all models
         project=ROOT / 'runs/track',  # save results to project/name
         name='exp',  # save results to project/name
@@ -70,9 +74,10 @@ def run(
         hide_class=False,  # hide IDs
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
-        vid_stride=1,  # video frame-rate stride
+        eval=False,  # run multi-gpu eval
 ):
 
+    clickPos = None
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (VID_FORMATS)
@@ -88,12 +93,15 @@ def run(
         exp_name = Path(yolo_weights[0]).stem
     else:  # multiple models after --yolo_weights
         exp_name = 'ensemble'
-    exp_name = name if name else exp_name + "_" + reid_weights.stem
+    exp_name = name if name else exp_name + "_" + strong_sort_weights.stem
     save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
     (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
     # Load model
-    device = select_device(device)
+    if eval:
+        device = torch.device(int(device))
+    else:
+        device = select_device(device)
     model = DetectMultiBackend(yolo_weights, device=device, dnn=dnn, data=None, fp16=half)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
@@ -101,9 +109,12 @@ def run(
     # Dataloader
     if webcam:
         show_vid = check_imshow()
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
+        cudnn.benchmark = True  # set True to speed up constant image size inference
+        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
         nr_sources = len(dataset)
     else:
+        show_vid = check_imshow()
+        cudnn.benchmark = True  # set True to speed up constant image size inference
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
         nr_sources = 1
     vid_path, vid_writer, txt_path = [None] * nr_sources, [None] * nr_sources, [None] * nr_sources
@@ -111,15 +122,18 @@ def run(
     # Create as many strong sort instances as there are video sources
     tracker_list = []
     for i in range(nr_sources):
-        tracker = create_tracker(tracking_method, reid_weights, device, half)
+        tracker = create_tracker(tracking_method, appearance_descriptor_weights, device, half)
         tracker_list.append(tracker, )
         if hasattr(tracker_list[i], 'model'):
             if hasattr(tracker_list[i].model, 'warmup'):
                 tracker_list[i].model.warmup()
     outputs = [None] * nr_sources
 
+    # CV tracker
+    trackerCV = cv2.TrackerMIL_create()
+
     # Run tracking
-    #model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
+    model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources
     for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):
@@ -168,34 +182,49 @@ def run(
             s += '%gx%g ' % im.shape[2:]  # print string
             imc = im0.copy() if save_crop else im0  # for save_crop
 
-            annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-            
-            if hasattr(tracker_list[i], 'tracker') and hasattr(tracker_list[i].tracker, 'camera_update'):
-                if prev_frames[i] is not None and curr_frames[i] is not None:  # camera motion compensation
-                    tracker_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
+            annotator = Annotator(im0, line_width=line_thickness, pil=not ascii)
+            #if cfg.STRONGSORT.ECC:  # camera motion compensation
+            #    strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
 
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()  # xyxy
+                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
 
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
+                xywhs = xyxy2xywh(det[:, 0:4])
+                confs = det[:, 4]
+                clss = det[:, 5]
+
                 # pass detections to strongsort
                 t4 = time_sync()
-                outputs[i] = tracker_list[i].update(det.cpu(), im0)
+                outputs[i] = tracker_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
                 t5 = time_sync()
                 dt[3] += t5 - t4
 
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
-                    for j, (output, conf) in enumerate(zip(outputs[i], det[:, 4])):
+                    for j, (output, conf) in enumerate(zip(outputs[i], confs)):
     
                         bboxes = output[0:4]
                         id = output[4]
                         cls = output[5]
+
+                        if clickPos is not None:
+                            center_x = clickPos[0] + clickPos[2] / 2
+                            center_y = clickPos[1] + clickPos[3] / 2
+                            # click 170.0; 293.5 out 0.0;240.0;277.0;199.0
+                            print("click " + str(center_x) + "; " + str(center_y) + " out " + 
+                                str(output[0]) + ";" + str(output[1]) + 
+                                ";" + str(output[2]) + ";" + str(output[3]))
+                            if center_x < output[2] and center_x > output[0] and center_y > output[1] and center_y < output[3]:
+                                 print("inside!")
+                                 clickPos = (int(output[0]), int(output[1]), int(output[2] - output[0]), int(output[3] - output[1]))
+                                 trackerCV.init(im0, clickPos)
+
 
                         if save_txt:
                             # to MOT format
@@ -225,10 +254,23 @@ def run(
                 LOGGER.info('No detections')
 
             # Stream results
+            successCV = False
+            boxCV = {}
+            if clickPos is not None:
+                (successCV, boxCV) = trackerCV.update(im0)
             im0 = annotator.result()
             if show_vid:
+                if successCV:
+                    (x, y, w, h) = [int(v) for v in boxCV]
+                    cv2.rectangle(im0, (x, y), (x + w, y + h),
+                        (0, 255, 0), 2)
                 cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("s"):
+                    clickPos = cv2.selectROI(str(p), im0, fromCenter=False,
+                        showCrosshair=True)
+                elif key == ord("q"):
+                    break
 
             # Save results (image with detections)
             if save_vid:
@@ -250,7 +292,7 @@ def run(
 
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
-    LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms {tracking_method} update per image at shape {(1, 3, *imgsz)}' % t)
+    LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms strong sort update per image at shape {(1, 3, *imgsz)}' % t)
     if save_txt or save_vid:
         s = f"\n{len(list(save_dir.glob('tracks/*.txt')))} tracks saved to {save_dir / 'tracks'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
@@ -261,8 +303,8 @@ def run(
 def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--yolo-weights', nargs='+', type=Path, default=WEIGHTS / 'yolov5m.pt', help='model.pt path(s)')
-    parser.add_argument('--reid-weights', type=Path, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
-    parser.add_argument('--tracking-method', type=str, default='strongsort', help='strongsort, ocsort, bytetrack')
+    parser.add_argument('--appearance-descriptor-weights', type=Path, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
+    parser.add_argument('--tracking-method', type=str, default='strongsort', help='strongsort, ocsort')
     parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')  
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
@@ -290,7 +332,7 @@ def parse_opt():
     parser.add_argument('--hide-class', default=False, action='store_true', help='hide IDs')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
-    parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
+    parser.add_argument('--eval', action='store_true', help='run evaluation')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))

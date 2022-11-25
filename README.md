@@ -1,8 +1,10 @@
 # Yolov5 + StrongSORT with OSNet
 
+Start tracker
 
+python3 track.py
 
-
+tracker: press 's' -> select rectangle with mouse -> press Enter
 
 <div align="center">
 <p>
